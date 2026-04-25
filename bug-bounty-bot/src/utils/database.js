@@ -1,75 +1,151 @@
-const Database = require('better-sqlite3');
+const initSqlJs = require('sql.js');
 const path = require('path');
 const fs = require('fs');
 
 const DB_DIR = path.join(__dirname, '..', '..', 'data');
 const DB_PATH = path.join(DB_DIR, 'bot.db');
 
-let db;
+let rawDb;
+let saveTimer;
 
-function initDatabase() {
+function persist() {
+  if (!rawDb) return;
+  try {
+    const data = rawDb.export();
+    fs.writeFileSync(DB_PATH, Buffer.from(data));
+  } catch (err) {
+    console.error('DB persist error:', err.message);
+  }
+}
+
+function scheduleSave() {
+  if (saveTimer) return;
+  saveTimer = setTimeout(() => {
+    persist();
+    saveTimer = null;
+  }, 1000);
+}
+
+function wrapStmt(sql) {
+  return {
+    run(...params) {
+      rawDb.run(sql, params);
+      const res = rawDb.exec('SELECT last_insert_rowid() AS id');
+      const changes = rawDb.getRowsModified();
+      scheduleSave();
+      return {
+        lastInsertRowid: res.length && res[0].values.length ? Number(res[0].values[0][0]) : 0,
+        changes,
+      };
+    },
+    get(...params) {
+      const stmt = rawDb.prepare(sql);
+      if (params.length) stmt.bind(params);
+      if (stmt.step()) {
+        const cols = stmt.getColumnNames();
+        const vals = stmt.get();
+        stmt.free();
+        const row = {};
+        cols.forEach((c, i) => { row[c] = vals[i]; });
+        return row;
+      }
+      stmt.free();
+      return undefined;
+    },
+    all(...params) {
+      const results = [];
+      const stmt = rawDb.prepare(sql);
+      if (params.length) stmt.bind(params);
+      while (stmt.step()) {
+        const cols = stmt.getColumnNames();
+        const vals = stmt.get();
+        const row = {};
+        cols.forEach((c, i) => { row[c] = vals[i]; });
+        results.push(row);
+      }
+      stmt.free();
+      return results;
+    },
+  };
+}
+
+const dbProxy = {
+  prepare(sql) { return wrapStmt(sql); },
+  exec(sql) { rawDb.run(sql); scheduleSave(); },
+};
+
+async function initDatabase() {
   if (!fs.existsSync(DB_DIR)) {
     fs.mkdirSync(DB_DIR, { recursive: true });
   }
 
-  db = new Database(DB_PATH);
-  db.pragma('journal_mode = WAL');
+  const SQL = await initSqlJs();
 
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS xp (
-      user_id TEXT NOT NULL,
-      guild_id TEXT NOT NULL,
-      xp INTEGER DEFAULT 0,
-      level INTEGER DEFAULT 0,
-      total_messages INTEGER DEFAULT 0,
-      last_xp_at INTEGER DEFAULT 0,
-      PRIMARY KEY (user_id, guild_id)
-    );
+  if (fs.existsSync(DB_PATH)) {
+    rawDb = new SQL.Database(fs.readFileSync(DB_PATH));
+  } else {
+    rawDb = new SQL.Database();
+  }
 
-    CREATE TABLE IF NOT EXISTS tickets (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id TEXT NOT NULL,
-      channel_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      type TEXT NOT NULL,
-      subject TEXT,
-      status TEXT DEFAULT 'open',
-      created_at INTEGER DEFAULT (unixepoch()),
-      closed_at INTEGER
-    );
+  rawDb.run(`CREATE TABLE IF NOT EXISTS xp (
+    user_id TEXT NOT NULL,
+    guild_id TEXT NOT NULL,
+    xp INTEGER DEFAULT 0,
+    level INTEGER DEFAULT 0,
+    total_messages INTEGER DEFAULT 0,
+    last_xp_at INTEGER DEFAULT 0,
+    PRIMARY KEY (user_id, guild_id)
+  )`);
 
-    CREATE TABLE IF NOT EXISTS giveaways (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id TEXT NOT NULL,
-      channel_id TEXT NOT NULL,
-      message_id TEXT NOT NULL,
-      host_id TEXT NOT NULL,
-      prize TEXT NOT NULL,
-      winners INTEGER DEFAULT 1,
-      ends_at INTEGER NOT NULL,
-      ended INTEGER DEFAULT 0
-    );
+  rawDb.run(`CREATE TABLE IF NOT EXISTS tickets (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    type TEXT NOT NULL,
+    subject TEXT,
+    status TEXT DEFAULT 'open',
+    created_at INTEGER DEFAULT 0,
+    closed_at INTEGER
+  )`);
 
-    CREATE TABLE IF NOT EXISTS giveaway_entries (
-      giveaway_id INTEGER NOT NULL,
-      user_id TEXT NOT NULL,
-      PRIMARY KEY (giveaway_id, user_id),
-      FOREIGN KEY (giveaway_id) REFERENCES giveaways(id)
-    );
+  rawDb.run(`CREATE TABLE IF NOT EXISTS giveaways (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    message_id TEXT NOT NULL,
+    host_id TEXT NOT NULL,
+    prize TEXT NOT NULL,
+    winners INTEGER DEFAULT 1,
+    ends_at INTEGER NOT NULL,
+    ended INTEGER DEFAULT 0
+  )`);
 
-    CREATE TABLE IF NOT EXISTS setup_state (
-      guild_id TEXT PRIMARY KEY,
-      completed INTEGER DEFAULT 0,
-      setup_at INTEGER
-    );
-  `);
+  rawDb.run(`CREATE TABLE IF NOT EXISTS giveaway_entries (
+    giveaway_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    PRIMARY KEY (giveaway_id, user_id),
+    FOREIGN KEY (giveaway_id) REFERENCES giveaways(id)
+  )`);
 
-  return db;
+  rawDb.run(`CREATE TABLE IF NOT EXISTS setup_state (
+    guild_id TEXT PRIMARY KEY,
+    completed INTEGER DEFAULT 0,
+    setup_at INTEGER
+  )`);
+
+  persist();
+
+  process.on('exit', persist);
+  process.on('SIGINT', () => { persist(); process.exit(); });
+  process.on('SIGTERM', () => { persist(); process.exit(); });
+
+  return dbProxy;
 }
 
 function getDb() {
-  if (!db) throw new Error('Database not initialized. Call initDatabase() first.');
-  return db;
+  if (!rawDb) throw new Error('Database not initialized. Call initDatabase() first.');
+  return dbProxy;
 }
 
 function getXp(userId, guildId) {
@@ -79,12 +155,14 @@ function getXp(userId, guildId) {
 
 function addXp(userId, guildId, amount) {
   const now = Date.now();
-  getDb().prepare(`
-    INSERT INTO xp (user_id, guild_id, xp, total_messages, last_xp_at)
-    VALUES (?, ?, ?, 1, ?)
-    ON CONFLICT(user_id, guild_id)
-    DO UPDATE SET xp = xp + ?, total_messages = total_messages + 1, last_xp_at = ?
-  `).run(userId, guildId, amount, now, amount, now);
+  const existing = getDb().prepare('SELECT * FROM xp WHERE user_id = ? AND guild_id = ?').get(userId, guildId);
+  if (existing) {
+    getDb().prepare('UPDATE xp SET xp = xp + ?, total_messages = total_messages + 1, last_xp_at = ? WHERE user_id = ? AND guild_id = ?')
+      .run(amount, now, userId, guildId);
+  } else {
+    getDb().prepare('INSERT INTO xp (user_id, guild_id, xp, total_messages, last_xp_at) VALUES (?, ?, ?, 1, ?)')
+      .run(userId, guildId, amount, now);
+  }
   return getXp(userId, guildId);
 }
 
@@ -102,8 +180,8 @@ function xpForLevel(level) {
 
 function createTicket(guildId, channelId, userId, type, subject) {
   const info = getDb().prepare(
-    'INSERT INTO tickets (guild_id, channel_id, user_id, type, subject) VALUES (?, ?, ?, ?, ?)'
-  ).run(guildId, channelId, userId, type, subject);
+    'INSERT INTO tickets (guild_id, channel_id, user_id, type, subject, created_at) VALUES (?, ?, ?, ?, ?, ?)'
+  ).run(guildId, channelId, userId, type, subject, Math.floor(Date.now() / 1000));
   return info.lastInsertRowid;
 }
 
@@ -149,9 +227,13 @@ function getActiveGiveaways() {
 }
 
 function markSetupComplete(guildId) {
-  getDb().prepare(
-    'INSERT INTO setup_state (guild_id, completed, setup_at) VALUES (?, 1, ?) ON CONFLICT(guild_id) DO UPDATE SET completed = 1, setup_at = ?'
-  ).run(guildId, Math.floor(Date.now() / 1000), Math.floor(Date.now() / 1000));
+  const existing = getDb().prepare('SELECT * FROM setup_state WHERE guild_id = ?').get(guildId);
+  const now = Math.floor(Date.now() / 1000);
+  if (existing) {
+    getDb().prepare('UPDATE setup_state SET completed = 1, setup_at = ? WHERE guild_id = ?').run(now, guildId);
+  } else {
+    getDb().prepare('INSERT INTO setup_state (guild_id, completed, setup_at) VALUES (?, 1, ?)').run(guildId, now);
+  }
 }
 
 function isSetupComplete(guildId) {

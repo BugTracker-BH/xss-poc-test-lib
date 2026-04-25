@@ -26,9 +26,12 @@ client.commands = new Collection();
 client.cooldowns = new Collection();
 client.antiRaidState = new Map();
 
-initDatabase();
-loadCommands(client);
-loadEvents(client);
+(async () => {
+  await initDatabase();
+  loadCommands(client);
+  loadEvents(client);
+  client.login(process.env.DISCORD_TOKEN);
+})();
 
 process.on('unhandledRejection', (error) => {
   console.error('Unhandled promise rejection:', error);
@@ -37,5 +40,3 @@ process.on('unhandledRejection', (error) => {
 process.on('uncaughtException', (error) => {
   console.error('Uncaught exception:', error);
 });
-
-client.login(process.env.DISCORD_TOKEN);

@@ -47,12 +47,12 @@ async function handleButton(interaction) {
     return handleNotificationRole(interaction);
   }
 
-  if (customId.startsWith('ticket_')) {
-    return handleTicketCreate(interaction);
-  }
-
   if (customId === 'ticket_close') {
     return handleTicketClose(interaction);
+  }
+
+  if (customId === 'ticket_report' || customId === 'ticket_support') {
+    return handleTicketCreate(interaction);
   }
 
   if (customId === 'giveaway_enter') {
