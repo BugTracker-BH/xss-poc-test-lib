@@ -1,0 +1,19 @@
+{
+  "name": "bug-bounty-underground-bot",
+  "version": "1.0.0",
+  "description": "Production-ready Discord bot for managing a cybersecurity and bug bounty server",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "deploy": "node src/deploy-commands.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "better-sqlite3": "^9.4.3",
+    "dotenv": "^16.3.1"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
